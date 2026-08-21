@@ -79,4 +79,4 @@ python -m PyInstaller FishBar.spec
 
 FishBar 源代码采用 [MIT License](LICENSE)。
 
-Noto Serif SC 字体采用 SIL Open Font License 1.1，详见 [NotoSerifSC-OFL.txt](NotoSerifSC-OFL.txt)。
+Noto Serif SC 字体采用 SIL Open Font License 1.1。许可全文请查看 [NotoSerifSC-OFL.txt](NotoSerifSC-OFL.txt)。
