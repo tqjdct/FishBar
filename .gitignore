@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+
+build/
+dist/
+repo-build-test/
+repo-dist-test/
+.venv/
+venv/
+
+# The variable font is embedded into release builds but kept out of Git history.
+NotoSerifSC-VF.ttf
+
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
