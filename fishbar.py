@@ -211,9 +211,30 @@ else:  # pragma: no cover - a small fallback keeps the prototype testable elsewh
 
 
 CHAPTER_RE = re.compile(
-    r"^\s*(第[零〇一二两三四五六七八九十百千万亿\d]+\s*[章节回卷集部篇].*|chapter\s+\d+.*)$",
+    r"^(?:"
+    r"第\s*[零〇○一二两三四五六七八九十百千万亿0-9０-９]+\s*[章节回卷集部篇].*"
+    r"|[卷部篇辑]\s*[零〇○一二两三四五六七八九十百千万亿0-9０-９]+.*"
+    r"|(?:chapter|volume|part)\s*[0-9ivxlcdm]+.*"
+    r"|(?:序章|序言|前言|楔子|引子|正文|终章|尾声|后记|大结局|完本感言|作品相关)(?:\s*[:：—-]?\s*.*)?"
+    r"|番外(?:\s*[零〇○一二两三四五六七八九十百千万亿0-9０-９]+)?(?:\s*[:：—-]?\s*.*)?"
+    r")$",
     re.IGNORECASE,
 )
+
+
+def chapter_heading(line: str) -> str:
+    """Return a plausible short chapter heading, or an empty string."""
+    heading = line.strip().lstrip("\ufeff").strip()
+    # Limiting recognition to a short, whole line keeps ordinary paragraphs
+    # out of the table of contents in typical TXT layouts.
+    if not heading or len(heading) > 100 or heading.endswith(tuple("。！？；!?;")):
+        return ""
+    return heading if CHAPTER_RE.fullmatch(heading) else ""
+
+
+def chapter_key(heading: str) -> str:
+    """Normalize harmless formatting differences for nearby de-duplication."""
+    return re.sub(r"[\s:：—\-()（）]+", "", heading).casefold()
 
 
 def font_family_from_file(path: str) -> str:
@@ -305,6 +326,8 @@ class Reader:
         self.full_text = ""
         self.page_index = 0
         self.chapter_for_page: dict[int, str] = {}
+        self.chapters: list[tuple[str, int]] = []
+        self._chapters_ready = False
         self._source_lines: list[tuple[str, int]] = []
 
     def set_layout(
@@ -370,8 +393,8 @@ class Reader:
             page_lines.clear()
 
         for line, source_start in self._source_lines:
-            heading = line.strip()
-            if CHAPTER_RE.match(heading):
+            heading = chapter_heading(line)
+            if heading:
                 chapter_pages[display_line_count // lines_per_page] = heading
             for display_line in self._wrap_line(line, source_start):
                 page_lines.append(display_line)
@@ -401,10 +424,37 @@ class Reader:
         self.page_starts = list(range(0, len(self.full_text), size))
         self.page_ends = [min(len(self.full_text), start + size) for start in self.page_starts]
         self.chapter_for_page = {}
-        for match in re.finditer(r"(?m)^.*$", self.full_text):
-            heading = match.group(0).strip()
-            if CHAPTER_RE.match(heading):
-                self.chapter_for_page[match.start() // size] = heading
+        for heading, offset in self.chapter_entries():
+            self.chapter_for_page[offset // size] = heading
+
+    def chapter_entries(self) -> list[tuple[str, int]]:
+        """Return chapter titles and exact source offsets for every read mode."""
+        if not self._chapters_ready:
+            self.chapters = []
+            for match in re.finditer(r"(?m)^[^\n]+", self.full_text):
+                heading = chapter_heading(match.group(0))
+                if heading:
+                    entry = (heading, match.start())
+                    # Downloaded novels commonly repeat the same heading
+                    # around a short website-advertisement block. Keep the
+                    # later copy because it is normally the actual body start.
+                    if (
+                        self.chapters
+                        and chapter_key(self.chapters[-1][0]) == chapter_key(heading)
+                        and match.start() - self.chapters[-1][1] <= 500
+                    ):
+                        self.chapters[-1] = entry
+                    else:
+                        self.chapters.append(entry)
+            self._chapters_ready = True
+        return self.chapters
+
+    def chapter_index_for_offset(self, offset: int) -> int:
+        chapters = self.chapter_entries()
+        if not chapters:
+            return -1
+        target = max(0, min(len(self.full_text), int(offset)))
+        return max(0, bisect_right([item[1] for item in chapters], target) - 1)
 
     def page_for_offset(self, offset: int) -> int:
         if not self.pages or not self.page_starts:
@@ -454,6 +504,8 @@ class Reader:
         # page for the conventional newline at end of file.
         self.full_text = text.rstrip("\n")
         self._source_lines = []
+        self.chapters = []
+        self._chapters_ready = False
         self.path = str(Path(path).resolve())
         self.title = Path(path).stem
         if paginate:
@@ -559,7 +611,15 @@ class FishBarApp:
     TRANSPARENT_COLOR = "#010101"
     TRAY_CALLBACK_MESSAGE = 0x8000 + 37  # WM_APP + private offset
     TRAY_ICON_ID = 1
-    HOTKEY_IDS = {1: "open", 2: "toggle", 3: "next", 4: "previous", 5: "settings", 6: "reset_position"}
+    HOTKEY_IDS = {
+        1: "open",
+        2: "toggle",
+        3: "next",
+        4: "previous",
+        5: "settings",
+        6: "reset_position",
+        7: "chapters",
+    }
     # MOD_CONTROL | MOD_ALT
     HOTKEY_MODIFIERS = 0x0002 | 0x0001
     NOTO_SERIF_SC_WEIGHTS = {
@@ -632,6 +692,7 @@ class FishBarApp:
         self.hover_inside = False
         self.startup_grace_until = 0.0
         self.settings_window: tk.Toplevel | None = None
+        self.chapter_window: tk.Toplevel | None = None
         self.hwnd = 0
         self.hotkey_queue: list[int] = []
         self.tray_event_queue: list[int] = []
@@ -1445,6 +1506,155 @@ class FishBarApp:
             self.store.save()
         self.show_panel()
 
+    def _current_reading_offset(self) -> int:
+        if not self.reader.path:
+            return 0
+        if self.reading_mode == "scroll":
+            if self.panel_visible:
+                self.text.update_idletasks()
+                self._update_scroll_location()
+            return max(0, min(len(self.reader.full_text), int(self.scroll_offset)))
+        return self.reader.current_offset() if self.reader.pages else 0
+
+    def _jump_to_offset(self, offset: int) -> None:
+        """Jump to an exact source offset without changing the reading mode."""
+        if not self.reader.path:
+            return
+        target = max(0, min(len(self.reader.full_text), int(offset)))
+        if self.reading_mode == "scroll":
+            self.scroll_offset = target
+            self.scroll_position = target / max(1, len(self.reader.full_text))
+            self.scroll_restore_by_offset = True
+            self._hidden_scroll_anchor = None
+        else:
+            if self.reader_layout_dirty or not self.reader.pages:
+                self.reader.repaginate(offset=target)
+                self.reader_layout_dirty = False
+            else:
+                self.reader.page_index = self.reader.page_for_offset(target)
+            self.scroll_offset = target
+            self.scroll_position = target / max(1, len(self.reader.full_text))
+
+        path = self.reader.path
+        self.store.progress[path] = self.reader.page_index
+        self.store.progress[f"offset::{path}"] = target
+        self.store.progress[f"scroll::{path}"] = self.scroll_position
+        self.store.progress[f"scroll_offset::{path}"] = target
+        self.store.settings["last_path"] = path
+        self.store.save()
+        self.show_panel()
+
+    def open_chapter_selector(self, parent: tk.Misc | None = None) -> None:
+        """Open a searchable table of contents for the active TXT novel."""
+        dialog_parent = parent or self.settings_window or self.panel
+        if not self.reader.path:
+            messagebox.showinfo("章节目录", "请先导入或切换到一本小说。", parent=dialog_parent)
+            return
+        chapters = self.reader.chapter_entries()
+        if not chapters:
+            messagebox.showinfo(
+                "未识别到章节",
+                "没有识别到常见章节标题。\n\n支持示例：第一章、卷一、序章、番外、Chapter 1。",
+                parent=dialog_parent,
+            )
+            return
+        if self.chapter_window and self.chapter_window.winfo_exists():
+            self.chapter_window.destroy()
+
+        win = self.chapter_window = tk.Toplevel(dialog_parent)
+        win.title(f"章节目录 - {self.reader.title}")
+        win.geometry("560x560")
+        win.minsize(420, 360)
+        win.configure(bg="#0f141b")
+        try:
+            win.attributes("-topmost", self.always_on_top)
+        except tk.TclError:
+            pass
+
+        header = tk.Frame(win, bg="#0f141b")
+        header.pack(fill="x", padx=18, pady=(16, 10))
+        tk.Label(header, text=self.reader.title, bg="#0f141b", fg="#f3f6f9", font=("Microsoft YaHei UI", 13, "bold"), anchor="w").pack(fill="x")
+        summary_text = tk.StringVar()
+        tk.Label(header, textvariable=summary_text, bg="#0f141b", fg="#91a0ae", font=("Microsoft YaHei UI", 9), anchor="w").pack(fill="x", pady=(3, 0))
+
+        search_var = tk.StringVar()
+        search = tk.Entry(win, textvariable=search_var, bg="#202b36", fg="#f3f6f9", insertbackground="#f3f6f9", relief="flat", font=("Microsoft YaHei UI", 10))
+        search.pack(fill="x", padx=18, ipady=7)
+
+        list_frame = tk.Frame(win, bg="#0f141b")
+        list_frame.pack(fill="both", expand=True, padx=18, pady=10)
+        list_frame.grid_rowconfigure(0, weight=1)
+        list_frame.grid_columnconfigure(0, weight=1)
+        chapter_list = tk.Listbox(
+            list_frame,
+            bg="#17212b",
+            fg="#e7edf3",
+            selectbackground="#2b79c2",
+            selectforeground="#ffffff",
+            activestyle="none",
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#2b3947",
+            font=("Microsoft YaHei UI", 10),
+            exportselection=False,
+        )
+        chapter_list.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=chapter_list.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        chapter_list.configure(yscrollcommand=scrollbar.set)
+
+        filtered: list[tuple[int, str, int]] = []
+        current_offset = self._current_reading_offset()
+        current_index = self.reader.chapter_index_for_offset(current_offset)
+
+        def refresh_filter(*_args: object) -> None:
+            query = search_var.get().strip().casefold()
+            filtered.clear()
+            chapter_list.delete(0, "end")
+            for index, (title, source_offset) in enumerate(chapters):
+                if query and query not in title.casefold() and query not in str(index + 1):
+                    continue
+                filtered.append((index, title, source_offset))
+                chapter_list.insert("end", f"{index + 1:>4}  {title}")
+            summary_text.set(f"共 {len(chapters)} 个章节 · 当前显示 {len(filtered)} 个")
+            if not query:
+                selected = next((row for row, item in enumerate(filtered) if item[0] == current_index), 0)
+                if filtered:
+                    chapter_list.selection_set(selected)
+                    chapter_list.activate(selected)
+                    chapter_list.see(selected)
+
+        def jump_selected(_event: tk.Event | None = None) -> None:
+            selection = chapter_list.curselection()
+            if not selection:
+                win.bell()
+                return
+            _index, _title, source_offset = filtered[int(selection[0])]
+            self._jump_to_offset(source_offset)
+            win.destroy()
+            self.chapter_window = None
+
+        search_var.trace_add("write", refresh_filter)
+        refresh_filter()
+        search.bind("<Down>", lambda _event: (chapter_list.focus_set(), chapter_list.selection_set(0)) if filtered else None)
+        search.bind("<Return>", jump_selected)
+        chapter_list.bind("<Double-Button-1>", jump_selected)
+        chapter_list.bind("<Return>", jump_selected)
+
+        footer = tk.Frame(win, bg="#0f141b")
+        footer.pack(fill="x", padx=18, pady=(0, 16))
+        tk.Button(footer, text="取消", command=win.destroy, bg="#293642", fg="#dce5ec", activebackground="#354756", activeforeground="#ffffff", relief="flat", padx=16, pady=6, cursor="hand2").pack(side="right")
+        tk.Button(footer, text="跳转到章节", command=jump_selected, bg="#2b79c2", fg="#ffffff", activebackground="#3b8bd1", activeforeground="#ffffff", relief="flat", padx=18, pady=6, cursor="hand2").pack(side="right", padx=(0, 8))
+
+        def close_chapters(_event: tk.Event | None = None) -> None:
+            if win.winfo_exists():
+                win.destroy()
+            self.chapter_window = None
+
+        win.bind("<Escape>", close_chapters)
+        win.protocol("WM_DELETE_WINDOW", close_chapters)
+        search.focus_set()
+
     @staticmethod
     def _path_key(path: str) -> str:
         """Return a case-insensitive key suitable for a Windows path library."""
@@ -1586,8 +1796,9 @@ class FishBarApp:
         self.store.save()
 
     def _register_hotkeys(self) -> None:
-        # Ctrl+Alt+O open, H toggle, Right/Left next/previous, S settings, R reset position.
-        for hotkey_id, key in ((1, ord("O")), (2, ord("H")), (3, 0x27), (4, 0x25), (5, ord("S")), (6, ord("R"))):
+        # Ctrl+Alt+O open, H toggle, Right/Left navigation, S settings,
+        # R reset position and C chapter selector.
+        for hotkey_id, key in ((1, ord("O")), (2, ord("H")), (3, 0x27), (4, 0x25), (5, ord("S")), (6, ord("R")), (7, ord("C"))):
             if register_hotkey(self.hwnd, hotkey_id, self.HOTKEY_MODIFIERS, key):
                 self.registered_hotkeys.add(hotkey_id)
 
@@ -1660,6 +1871,7 @@ class FishBarApp:
             return
         user32.AppendMenuW(menu, MF_STRING, 1001, "显示阅读面板")
         user32.AppendMenuW(menu, MF_STRING, 1002, "导入 TXT 小说…")
+        user32.AppendMenuW(menu, MF_STRING, 1006, "章节目录…")
         user32.AppendMenuW(menu, MF_STRING, 1003, "设置…")
         user32.AppendMenuW(menu, MF_STRING | (MF_CHECKED if self.always_on_top else 0), 1004, "窗口置顶")
         user32.AppendMenuW(menu, MF_STRING, 1005, "重置窗口位置")
@@ -1676,6 +1888,8 @@ class FishBarApp:
         elif command == 1002:
             self.show_panel()
             self.open_book()
+        elif command == 1006:
+            self.open_chapter_selector()
         elif command == 1003:
             self.open_settings()
         elif command == 1004:
@@ -1708,6 +1922,8 @@ class FishBarApp:
                 self.open_settings()
             elif action == "reset_position":
                 self.reset_panel_position()
+            elif action == "chapters":
+                self.open_chapter_selector()
         while self.tray_event_queue and not self.closing:
             self._handle_tray_event(self.tray_event_queue.pop(0))
         if not self.closing:
@@ -2019,6 +2235,7 @@ class FishBarApp:
             )
             library_choice.set(selected_label or "尚未导入小说")
             switch_book_button.configure(state="normal" if labels else "disabled")
+            chapter_button.configure(state="normal" if self.reader.path else "disabled")
             if self.reader.path:
                 current_book_text.set(f"当前阅读：{self.reader.title}")
             else:
@@ -2091,7 +2308,9 @@ class FishBarApp:
         book_combo.grid(row=0, column=0, sticky="ew")
         switch_book_button = tk.Button(book_row, text="切换", command=switch_selected_book, bg="#344f67", fg="white", activebackground="#416786", activeforeground="white", relief="flat", padx=14, pady=4, cursor="hand2")
         switch_book_button.grid(row=0, column=1, padx=(8, 0))
-        tk.Button(book_row, text="导入新小说…", command=import_library_book, bg="#2b79c2", fg="white", activebackground="#3b8bd1", activeforeground="white", relief="flat", padx=14, pady=4, cursor="hand2").grid(row=0, column=2, padx=(8, 0))
+        chapter_button = tk.Button(book_row, text="章节目录…", command=lambda: self.open_chapter_selector(win), bg="#344f67", fg="white", activebackground="#416786", activeforeground="white", relief="flat", padx=14, pady=4, cursor="hand2")
+        chapter_button.grid(row=0, column=2, padx=(8, 0))
+        tk.Button(book_row, text="导入新小说…", command=import_library_book, bg="#2b79c2", fg="white", activebackground="#3b8bd1", activeforeground="white", relief="flat", padx=14, pady=4, cursor="hand2").grid(row=0, column=3, padx=(8, 0))
         tk.Label(library_section, textvariable=current_book_text, bg=surface, fg=muted, font=("Microsoft YaHei UI", 8), anchor="w").grid(row=3, column=0, columnspan=2, sticky="ew", pady=(2, 0))
         refresh_library_controls()
 
@@ -2193,7 +2412,7 @@ class FishBarApp:
 
         footer = tk.Frame(win, bg=bg)
         footer.pack(fill="x", padx=24, pady=(0, 18))
-        tk.Label(footer, text="鼠标离开面板后会自动隐藏\n快捷键：Ctrl+Alt+O 导入到书库 · H 显示/隐藏 · ←/→ 翻页或滚屏 · S 设置", bg=bg, fg=muted, justify="left", anchor="w", font=("Microsoft YaHei UI", 8)).pack(side="left", fill="x", expand=True)
+        tk.Label(footer, text="鼠标离开面板后会自动隐藏\n快捷键：Ctrl+Alt+O 导入 · C 章节目录 · H 显示/隐藏 · ←/→ 翻页或滚屏 · S 设置", bg=bg, fg=muted, justify="left", anchor="w", font=("Microsoft YaHei UI", 8)).pack(side="left", fill="x", expand=True)
         tk.Button(footer, text="保存并关闭", command=save_settings, bg="#2b79c2", fg="white", activebackground="#3b8bd1", activeforeground="white", relief="flat", padx=16, pady=7, cursor="hand2").pack(side="right")
         win.bind("<Return>", lambda _event: save_settings())
         win.protocol("WM_DELETE_WINDOW", close_settings)
