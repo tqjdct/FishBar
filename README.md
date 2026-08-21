@@ -4,6 +4,16 @@ FishBar 是一个轻量的 Windows 桌面 TXT 小说阅读器。阅读面板可�
 
 > **AI 制作说明**：本项目由用户提出需求，并由 AI（OpenAI Codex）协助完成界面设计、程序开发、测试优化和文档整理。
 
+## 效果展示
+
+**鼠标移入：显示阅读内容**
+
+![鼠标移入后显示 FishBar 阅读内容](assets/screenshots/fishbar-mouse-hover.png)
+
+**鼠标移开：自动隐藏阅读内容**
+
+![鼠标移开后 FishBar 自动隐藏阅读内容](assets/screenshots/fishbar-mouse-away.png)
+
 ## 主要功能
 
 - 翻页阅读与无级像素滚动
